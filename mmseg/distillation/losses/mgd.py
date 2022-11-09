@@ -1,0 +1,103 @@
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+from ..builder import DISTILL_LOSSES
+
+
+@DISTILL_LOSSES.register_module()
+class FeatureLoss(nn.Module):
+    """PyTorch version of `Masked Generative Distillation`
+
+    Args:
+        num_classes(int): Number of classes in the cityscapes.
+        student_channels(int): Number of channels in the student's feature map.
+        teacher_channels(int): Number of channels in the teacher's feature map.
+        name (str): the loss name of the layer
+        alpha_mgd (float, optional): Weight of dis_loss. Defaults to 0.00002
+        lambda_mgd (float, optional): masked ratio. Defaults to 0.75
+    """
+
+    def __init__(self,
+
+                 student_channels,
+                 teacher_channels,
+                 name,
+                 alpha_mgd=0.00002,
+                 lambda_mgd=0.75,
+
+                 ):
+        super(FeatureLoss, self).__init__()
+        self.alpha_mgd = alpha_mgd
+        self.lambda_mgd = lambda_mgd
+        self.name = name
+        self.log_sm = torch.nn.LogSoftmax(dim=1)
+        self.sm = torch.nn.Softmax(dim=1)
+        # self.num_classes = num_classes
+        # self.class_weight = torch.FloatTensor(self.num_classes).zero_().cuda() + 1
+
+        if student_channels != teacher_channels:
+            self.align = nn.Conv2d(student_channels, teacher_channels, kernel_size=1, stride=1, padding=0)
+        else:
+            self.align = None
+
+        self.generation = nn.Sequential(
+            nn.Conv2d(teacher_channels, teacher_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(teacher_channels, teacher_channels, kernel_size=3, padding=1))
+
+    def forward(self,
+                preds_S,
+                preds_T):
+        """Forward function.
+        Args:
+            preds_S(Tensor): Bs*C*H*W, student's feature map
+            preds_T(Tensor): Bs*C*H*W, teacher's feature map
+        """
+        assert preds_S.shape[-2:] == preds_T.shape[-2:]
+
+        if self.align is not None:
+            preds_S = self.align(preds_S)
+
+        loss = self.get_dis_loss(preds_S, preds_T) * self.alpha_mgd
+
+        return loss
+
+    # def get_dis_loss(self, preds_S, preds_T):
+    #     loss_mse = nn.MSELoss(reduction='sum')
+    #     N, C, H, W = preds_T.shape
+    #
+    #     device = preds_S.device
+    #     mat = torch.rand((N,C,H,W)).to(device)
+    #     mat = torch.where(mat>1-self.lambda_mgd, 0, 1).to(device)
+    #
+    #     masked_fea = torch.mul(preds_S, mat)
+    #     new_fea = self.generation(masked_fea)
+    #
+    #     dis_loss = loss_mse(new_fea, preds_T)/N
+    #
+    #     return dis_loss
+
+    def get_dis_loss(self, preds_S, preds_T):
+        # loss_mse = nn.MSELoss(reduction='none')
+
+        criterion = nn.CrossEntropyLoss(reduction='none')
+        kl_distance = nn.KLDivLoss(reduction='none')
+
+        N, C, H, W = preds_T.shape
+
+        device = preds_S.device
+        mat = torch.rand((N, 1, H, W)).to(device)
+        mat = torch.where(mat > 1 - self.lambda_mgd, 0, 1).to(device)
+
+        masked_fea = torch.mul(preds_S, mat)
+        new_fea = self.generation(masked_fea)
+
+        # loss = loss_mse(new_fea, preds_T)
+
+        loss = criterion(new_fea, preds_T)
+        variance = torch.sum(kl_distance(self.log_sm(new_fea), self.sm(preds_S)), dim=1)
+        exp_variance = torch.exp(-variance)
+        dis_loss1 = torch.mean(loss * exp_variance) + torch.mean(variance * variance)
+        dis_loss = dis_loss1/N
+
+        return dis_loss
